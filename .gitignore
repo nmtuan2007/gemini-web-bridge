@@ -1,9 +1,15 @@
 __pycache__/
 *.pyc
+.venv/
+venv/
 config.json
 cookie.txt
+cookie*.txt
 cookie.json
 .env
 .idea
 .DS_Store
 gemini-auth.json
+native-host/server.log
+native-host/server.pid
+native-host/com.gemini_web2api.host.json

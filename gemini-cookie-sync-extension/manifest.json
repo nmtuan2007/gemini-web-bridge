@@ -1,20 +1,29 @@
 {
   "manifest_version": 3,
-  "name": "Gemini Cookie Sync",
-  "version": "1.0",
-  "description": "Exports Gemini cookies plus XSRF/build metadata for gemini-web2api.",
+  "name": "Gemini Web2API Controller",
+  "version": "2.1",
+  "description": "One-click Start/Stop controller, live request monitor, and auto cookie sync for local gemini-web2api.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEArEbY8xcYwJ1nORnDBY3wacC99c/FDGXkVxBMYf+b50bW5UcsYIE23tA2P0cp6eMqyG1pXXnxMFUoXFxd9I9tvMTeQGE0oBnMGKM9TrrpqCThPlyzhmPlr1HaNAadivy63JFybMfQVQ96oe32kWmHzmUIHwjU8RqUiu0rAgLX3fD5gXxev7kTe+CiNzAhh39iOFjZqK+PhoRq2Nj6d6j+vhktljWE3FF9wch29vNwfLFzYW8ADKyFERkBiPLzxIm4DOYnaaQtWQvP/qMbu3TYRjQcKnHN+nmjv9WYq05MacM7UndVav/mE5ZcaUy4AtFPdNpgax/CDsx12rQg5xoOtwIDAQAB",
   "permissions": [
     "cookies",
     "downloads",
     "tabs",
-    "scripting"
+    "scripting",
+    "nativeMessaging",
+    "alarms",
+    "storage"
   ],
   "host_permissions": [
-    "https://google.com/*",
-    "https://*.google.com/*"
+    "*://google.com/*",
+    "*://*.google.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
-    "default_title": "Gemini Cookie Sync",
+    "default_title": "Gemini Web2API",
     "default_popup": "popup.html"
   }
 }

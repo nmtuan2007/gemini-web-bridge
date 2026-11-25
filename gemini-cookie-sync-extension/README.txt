@@ -1,19 +1,16 @@
-Gemini Cookie Sync v1.0
+Gemini Web2API Controller v2.1
 
 Purpose:
-- Read cookies for the current Google/Gemini session.
-- Extract the XSRF token named SNlM0e from the Gemini page.
-- Extract gemini_bl from cfb2h or from page requests when available.
-- Export `gemini-auth.json` locally only.
+- One-click Start / Stop / Restart local server via Windows Native Messaging (`native-host/`).
+- Automatically sync Google/Gemini session cookies, SAPISID, XSRF (`SNlM0e`), and `cfb2h` (`gemini_bl`).
+- Monitor live API requests, tool_calls emitted, latency, and server logs from the popup Monitor tab.
+- Test OpenAI tool_calls compatibility (`Test Tool Call`) and copy Harness Agent configuration.
 
-Installation:
-1. Open `chrome://extensions`
-2. Enable Developer mode
-3. Click Load unpacked
-4. Select this folder
-5. Open `https://gemini.google.com/app`, sign in, and refresh the page
-6. Click Inspect session
-7. Click Export `gemini-auth.json`
+Installation (Windows):
+1. Create `.venv` and copy `config.example.json` to `config.json`.
+2. Run `powershell -ExecutionPolicy Bypass -File .\native-host\register-native-host.ps1`.
+3. Open `chrome://extensions`, enable Developer mode, and click Load unpacked -> select this folder.
+4. Sign in at `https://gemini.google.com/app`, then click the extension icon -> Start.
 
 Security:
-The generated file represents the real Google session and must be treated as secret. Do not send it, print it, or commit it to Git.
+Synced cookies and exported `gemini-auth.json` represent your real Google session. Never share or commit them to Git.

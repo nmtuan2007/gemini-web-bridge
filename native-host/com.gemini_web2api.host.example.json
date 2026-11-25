@@ -1,0 +1,9 @@
+{
+  "name": "com.gemini_web2api.host",
+  "description": "Control local gemini-web2api server from Gemini Web2API Controller extension",
+  "path": "C:\\path\\to\\gemini-web-bridge\\native-host\\host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://aelicddajdhceggpmkpghhpkfkeffgln/"
+  ]
+}

@@ -109,6 +109,7 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
     parts = []
     images = []
 
+    tool_block = ""
     if tools and tool_choice != "none":
         tool_defs = []
         for tool in tools:
@@ -120,15 +121,25 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
             })
         if tool_defs:
             constraint = _build_tool_choice_instruction(tool_choice, tool_defs)
-            parts.append(
-                "# Tool Use\n\n"
-                "You can call the following tools. Call format:\n"
+            closing_rule = (
+                "If a tool is needed for the next step, output ONLY the ```tool_call``` block(s) now; "
+                "if you already have all required `[Tool result ...]` data, answer the user directly."
+            )
+            if tool_choice == "required" or isinstance(tool_choice, dict):
+                closing_rule = "Output ONLY the ```tool_call``` block(s) now."
+            tool_block = (
+                "[External OpenAI Tool Harness Protocol]\n"
+                "An external client harness executes the declared tools for you after each response.\n"
+                "When a task requires reading files, searching, or running commands:\n"
+                "- NEVER claim you lack file access or that no tool calls remain.\n"
+                "- Output ONLY valid double-quoted JSON wrapped in ```tool_call fences using exact tool names below:\n"
                 '```tool_call\n{"name": "func_name", "arguments": {...}}\n```\n'
-                "When calling tools, output ONLY the tool_call block(s).\n\n"
-                f"Available tools:\n{json.dumps(tool_defs, indent=2)}"
-                f"{constraint}"
+                "- You may emit multiple ```tool_call blocks when calling multiple tools in parallel.\n\n"
+                f"Available tools:\n{json.dumps(tool_defs, separators=(',', ':'), ensure_ascii=False)}"
+                f"{constraint}\n\n{closing_rule}"
             )
 
+    tool_call_names = {}
     for msg in messages:
         role = msg.get("role", "user")
         content = msg.get("content", "")
@@ -136,6 +147,8 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
         if isinstance(content, list):
             text_parts = []
             for c in content:
+                if not isinstance(c, dict):
+                    continue
                 if c.get("type") in ("text", "input_text"):
                     text_parts.append(c.get("text", ""))
                 else:
@@ -145,52 +158,160 @@ def messages_to_prompt(messages: list, tools: list = None, tool_choice=None) -> 
                         text_parts.append("[Image attached]")
             content = " ".join(text_parts)
 
-        if role == "system":
+        if role in ("system", "developer"):
             parts.append(f"[System instruction]: {content}")
         elif role == "assistant":
             if msg.get("tool_calls"):
                 tc_strs = []
                 for tc in msg["tool_calls"]:
                     fn = tc.get("function", {})
+                    tc_id = tc.get("id", "")
+                    tc_name = fn.get("name", "")
+                    if tc_id and tc_name:
+                        tool_call_names[tc_id] = tc_name
                     tc_strs.append(
-                        f'```tool_call\n{{"name": "{fn.get("name")}", '
+                        f'```tool_call\n{{"name": "{tc_name}", '
                         f'"arguments": {fn.get("arguments", "{}")}}}\n```'
                     )
                 parts.append(f"[Assistant]: {content or ''}\n" + "\n".join(tc_strs))
             else:
                 parts.append(f"[Assistant]: {content}")
         elif role == "tool":
-            parts.append(f"[Tool result for {msg.get('name', '')}]: {content}")
+            tool_call_id = msg.get("tool_call_id", "")
+            tool_name = msg.get("name") or tool_call_names.get(tool_call_id, "")
+            if tool_name and tool_call_id:
+                label = f"{tool_name} ({tool_call_id})"
+            else:
+                label = tool_name or tool_call_id or "tool"
+            parts.append(f"[Tool result for {label}]: {content}")
         else:
             parts.append(content if content else "")
+
+    if tool_block:
+        parts.append(tool_block)
 
     prompt = "\n\n".join(p for p in parts if p)
     return prompt, images
 
 
-def parse_tool_calls(text: str) -> tuple:
-    """Extract tool_call blocks. Returns (clean_text, tool_calls_list)."""
+def _coerce_tool_call_item(data) -> dict:
+    """Validate and normalize one parsed tool call dict into OpenAI format."""
+    if not isinstance(data, dict):
+        return None
+    name = data.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+    args = data.get("arguments", data.get("args", {}))
+    if isinstance(args, str):
+        stripped = args.strip()
+        if not stripped:
+            args_json = "{}"
+        else:
+            try:
+                args_json = json.dumps(json.loads(stripped), ensure_ascii=False)
+            except json.JSONDecodeError:
+                args_json = json.dumps({"raw": args}, ensure_ascii=False)
+    else:
+        if args is None:
+            args = {}
+        args_json = json.dumps(args, ensure_ascii=False)
+    return {
+        "id": f"call_{uuid.uuid4().hex[:8]}",
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": args_json,
+        },
+    }
+
+
+def _decode_json_candidates(raw: str) -> list:
+    """Decode one or multiple JSON objects/arrays from a raw block."""
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+        if isinstance(parsed, dict):
+            return [parsed]
+        return []
+    except json.JSONDecodeError:
+        pass
+
+    decoder = json.JSONDecoder()
+    items = []
+    idx = 0
+    length = len(text)
+    while idx < length:
+        while idx < length and text[idx].isspace():
+            idx += 1
+        if idx >= length:
+            break
+        if text[idx] != "{":
+            break
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError:
+            break
+        if isinstance(obj, dict):
+            items.append(obj)
+        idx = end
+    return items if idx >= length or not text[idx:].strip() else []
+
+
+def parse_tool_calls(text: str, allowed_names: set = None) -> tuple:
+    """Extract tool_call blocks (with optional declared-tool JSON fallback).
+
+    Returns (clean_text, tool_calls_list).
+    """
     tool_calls = []
-    pattern = r'```tool_call\s*\n(.*?)\n```'
+    pattern = r'```(?:tool_call|tool-call|toolcall)\s*\n?(.*?)\n?```'
     clean_parts = []
     last_end = 0
-    for m in re.finditer(pattern, text, re.DOTALL):
+    for m in re.finditer(pattern, text, re.DOTALL | re.IGNORECASE):
         clean_parts.append(text[last_end:m.start()])
         last_end = m.end()
-        try:
-            data = json.loads(m.group(1).strip())
-            tool_calls.append({
-                "id": f"call_{uuid.uuid4().hex[:8]}",
-                "type": "function",
-                "function": {
-                    "name": data["name"],
-                    "arguments": json.dumps(data.get("arguments", {}), ensure_ascii=False),
-                },
-            })
-        except (json.JSONDecodeError, KeyError):
-            pass
+        for candidate in _decode_json_candidates(m.group(1)):
+            item = _coerce_tool_call_item(candidate)
+            if item is not None:
+                tool_calls.append(item)
     clean_parts.append(text[last_end:])
     clean = "".join(clean_parts).strip()
+
+    if not tool_calls and allowed_names:
+        # Fallback for ```json blocks whose objects exclusively name declared tools.
+        json_fence = r'```(?:json)?\s*\n?(.*?)\n?```'
+        fb_parts = []
+        fb_end = 0
+        matched_fallback = []
+        for m in re.finditer(json_fence, text, re.DOTALL | re.IGNORECASE):
+            candidates = _decode_json_candidates(m.group(1))
+            items = [_coerce_tool_call_item(c) for c in candidates]
+            valid_items = [
+                it for it in items
+                if it is not None and it["function"]["name"] in allowed_names
+            ]
+            if candidates and len(valid_items) == len(candidates):
+                fb_parts.append(text[fb_end:m.start()])
+                fb_end = m.end()
+                matched_fallback.extend(valid_items)
+        if matched_fallback:
+            fb_parts.append(text[fb_end:])
+            return "".join(fb_parts).strip(), matched_fallback
+
+        # Fallback for bare JSON tool call payload(s) when the model omitted markdown fences.
+        bare_candidates = _decode_json_candidates(clean)
+        bare_items = [_coerce_tool_call_item(c) for c in bare_candidates]
+        valid_bare = [
+            it for it in bare_items
+            if it is not None and it["function"]["name"] in allowed_names
+        ]
+        if bare_candidates and len(valid_bare) == len(bare_candidates):
+            return "", valid_bare
+
     return clean, tool_calls
 
 

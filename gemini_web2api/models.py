@@ -40,6 +40,36 @@ MODELS = {
         "mode": 6, "think": 4,
         "desc": "Lightweight fast model",
     },
+    "gemini-4-hydrogen": {
+        "mode": 1, "think": 1,
+        "desc": "Everyday help (Gemini 4 Hydrogen)",
+        "context_window": 1000000,
+        "max_tokens": 65536,
+    },
+    "gemini-4-neon": {
+        "mode": 3, "think": 2, "extra": {80: 2},
+        "desc": "Deeper analysis (Gemini 4 Neon High)",
+        "context_window": 1000000,
+        "max_tokens": 65536,
+    },
+    "gemini-4-neon-high": {
+        "mode": 3, "think": 2, "extra": {80: 2},
+        "desc": "Deeper analysis, extended thinking (Gemini 4 Neon High)",
+        "context_window": 1000000,
+        "max_tokens": 65536,
+    },
+    "gemini-4-neon-medium": {
+        "mode": 3, "think": 4, "extra": {80: 4},
+        "desc": "Deeper analysis, medium thinking (Gemini 4 Neon Medium)",
+        "context_window": 1000000,
+        "max_tokens": 65536,
+    },
+    "gemini-4-carbon": {
+        "mode": 8, "think": 2, "extra": {80: 2},
+        "desc": "Code & complex work (Gemini 4 Carbon / Ultra)",
+        "context_window": 1000000,
+        "max_tokens": 65536,
+    },
 }
 
 
@@ -65,4 +95,7 @@ def resolve_model(model_name: str, default: str = "gemini-3.6-flash"):
     mode_id = cfg["mode"]
     think_mode = think_override if think_override is not None else cfg["think"]
     extra = cfg.get("extra")
+    if extra is not None and think_override is not None and 80 in extra:
+        extra = dict(extra)
+        extra[80] = think_override
     return model_name, mode_id, think_mode, None, extra

@@ -1,17 +1,52 @@
 """HTTP server: OpenAI-compatible API endpoints."""
 import json
+import queue
 import time
+import threading
 import uuid
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 
-from .config import CONFIG
+from .config import CONFIG, save_config
 from .models import MODELS, resolve_model
-from .gemini import generate, generate_stream, log
+from .gemini import (
+    apply_auth_bundle,
+    begin_request,
+    clear_telemetry,
+    finish_request,
+    generate,
+    generate_stream,
+    get_recent_logs,
+    get_session_status,
+    get_telemetry,
+    log,
+    refresh_page_session,
+)
 from .tools import messages_to_prompt, parse_tool_calls, google_contents_to_prompt, parse_google_function_calls
 from .multimodal import detect_image_mime, fetch_image_bytes, upload_image
 from . import __version__
+
+CLIENT_DISCONNECT_ERRORS = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)
+
+
+def _extract_allowed_tool_names(tools) -> set:
+    """Return declared function tool names from an OpenAI tools list."""
+    names = set()
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function", tool) if tool.get("type") == "function" else tool
+        name = fn.get("name") or tool.get("name")
+        if isinstance(name, str) and name.strip():
+            names.add(name.strip())
+    return names
+
+
+def _wants_stream_usage(req: dict) -> bool:
+    """Return True when caller requested OpenAI streaming usage reporting."""
+    opts = req.get("stream_options")
+    return isinstance(opts, dict) and bool(opts.get("include_usage"))
 
 
 def _usage(prompt: str, text: str) -> dict:
@@ -115,6 +150,22 @@ class GeminiHandler(BaseHTTPRequestHandler):
                     return True
         return False
 
+    def _is_allowed_admin_request(self) -> bool:
+        """Restrict /admin/* endpoints to loopback clients and local/extension origins."""
+        client_ip = self.client_address[0] if self.client_address else ""
+        if client_ip not in ("127.0.0.1", "::1", "::ffff:127.0.0.1"):
+            return False
+        origin = (self.headers.get("Origin") or "").strip()
+        if origin and not (
+            origin.startswith("chrome-extension://")
+            or origin.startswith("edge-extension://")
+            or origin.startswith("moz-extension://")
+            or origin.startswith("http://127.0.0.1")
+            or origin.startswith("http://localhost")
+        ):
+            return False
+        return True
+
     def do_OPTIONS(self):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -124,52 +175,230 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path_only, _, query_str = self.path.partition("?")
+            if path_only.startswith("/admin/"):
+                if not self._is_allowed_admin_request():
+                    self.send_json({"error": {"message": "forbidden"}}, 403)
+                    return
+                if not self._authorized():
+                    self.send_json({"error": {"message": "invalid api key"}}, 401)
+                    return
+                if path_only == "/admin/auth/status":
+                    status_payload = get_session_status()
+                    status_payload.update({
+                        "version": __version__,
+                        "models": list(MODELS.keys()),
+                        "telemetry": get_telemetry(),
+                    })
+                    self.send_json(status_payload)
+                    return
+                if path_only == "/admin/logs":
+                    limit = 80
+                    for pair in query_str.split("&"):
+                        if pair.startswith("lines="):
+                            try:
+                                limit = int(pair[6:])
+                            except ValueError:
+                                pass
+                    self.send_json({"ok": True, "lines": get_recent_logs(limit)})
+                    return
+            if path_only.startswith("/v1") and not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
-            if self.path == "/v1/models":
+            if path_only == "/v1/models":
                 self.send_json({"object": "list", "data": [
-                    {"id": n, "object": "model", "created": 1700000000,
-                     "owned_by": "google", "description": c["desc"]}
+                    {
+                        "id": n,
+                        "object": "model",
+                        "created": 1700000000,
+                        "owned_by": "google",
+                        "description": c["desc"],
+                        "context_window": c.get("context_window", 1000000),
+                        "context_length": c.get("context_window", 1000000),
+                        "max_tokens": c.get("max_tokens", 65536),
+                        "max_output_tokens": c.get("max_tokens", 65536),
+                    }
                     for n, c in MODELS.items()
                 ]})
-            elif self.path.startswith("/v1beta/models"):
+            elif path_only.startswith("/v1beta/models"):
                 self.send_json({"models": [
                     {"name": f"models/{n}", "displayName": n, "description": c["desc"],
                      "supportedGenerationMethods": ["generateContent", "streamGenerateContent"]}
                     for n, c in MODELS.items()
                 ]})
-            elif self.path == "/":
+            elif path_only == "/":
                 self.send_json({"status": "ok", "version": __version__, "models": list(MODELS.keys())})
             else:
                 self.send_json({"error": "not found"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_DISCONNECT_ERRORS:
+            pass
+
+    def _drain_request_body(self, max_bytes: int = 65536) -> None:
+        """Drain small unread POST bodies before early error replies so Windows sockets don't RST."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            if 0 < length <= max_bytes:
+                self.rfile.read(length)
+        except Exception:
             pass
 
     def do_POST(self):
         try:
-            if self.path.startswith("/v1") and not self._authorized():
+            path_only = self.path.split("?", 1)[0]
+            if path_only.startswith("/admin/"):
+                if not self._is_allowed_admin_request():
+                    self._drain_request_body()
+                    self.send_json({"error": {"message": "forbidden"}}, 403)
+                    return
+                if not self._authorized():
+                    self._drain_request_body()
+                    self.send_json({"error": {"message": "invalid api key"}}, 401)
+                    return
+            if path_only.startswith("/v1") and not self._authorized():
+                self._drain_request_body()
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
             body = self._read_request_body()
-            if self.path == "/v1/chat/completions":
+            if path_only == "/admin/auth":
+                self._handle_admin_auth(body)
+            elif path_only == "/admin/config":
+                self._handle_admin_config(body)
+            elif path_only == "/admin/telemetry/clear":
+                self.send_json({"ok": True, "telemetry": clear_telemetry()})
+            elif path_only == "/admin/shutdown":
+                self.send_json({"ok": True, "stopping": True})
+                threading.Thread(target=self.server.shutdown, daemon=True).start()
+            elif path_only == "/v1/chat/completions":
                 self._handle_chat(body)
-            elif self.path == "/v1/responses":
+            elif path_only == "/v1/responses":
                 self._handle_responses(body)
-            elif ":streamGenerateContent" in self.path:
+            elif ":streamGenerateContent" in path_only:
                 self._handle_google_generate(body, stream=True)
-            elif ":generateContent" in self.path:
+            elif ":generateContent" in path_only:
                 self._handle_google_generate(body, stream=False)
             else:
                 self.send_json({"error": "not found"}, 404)
-        except (BrokenPipeError, ConnectionResetError):
+        except CLIENT_DISCONNECT_ERRORS:
             pass
         except Exception as e:
             log(f"POST error: {e}")
             try:
                 self.send_json({"error": {"message": str(e)}}, 500)
-            except:
+            except Exception:
                 pass
+
+    def _handle_admin_config(self, body: bytes):
+        req = self._parse_body(body)
+        if not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        if "default_model" in req:
+            candidate = req["default_model"]
+            if candidate not in MODELS:
+                self.send_json({"error": {"message": f"unknown model: {candidate}"}}, 400)
+                return
+            CONFIG["default_model"] = candidate
+        if "temporary_chats" in req:
+            CONFIG["temporary_chats"] = bool(req["temporary_chats"])
+        save_config()
+        self.send_json({
+            "ok": True,
+            "default_model": CONFIG.get("default_model"),
+            "temporary_chats": bool(CONFIG.get("temporary_chats", False)),
+        })
+
+    def _handle_admin_auth(self, body: bytes):
+        req = self._parse_body(body)
+        if not isinstance(req, dict):
+            self.send_json({"error": {"message": "invalid JSON"}}, 400)
+            return
+        cookie_str = req.get("cookie")
+        if not isinstance(cookie_str, str) or not cookie_str.strip():
+            self.send_json({"error": {"message": "cookie is required"}}, 400)
+            return
+        applied = apply_auth_bundle(
+            cookie_str=cookie_str,
+            sapisid=req.get("sapisid"),
+            auth_user=req.get("auth_user"),
+            xsrf_token=req.get("xsrf_token"),
+            gemini_bl=req.get("gemini_bl"),
+        )
+        if req.get("verify", True):
+            status = refresh_page_session()
+            applied.update(status)
+        else:
+            applied["ok"] = True
+        self.send_json(applied)
+
+    def _write_sse_json(self, payload: dict):
+        self.wfile.write(f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+        self.wfile.flush()
+
+    def _run_generate_with_sse_keepalive(self, prompt: str, model_id: int, think_mode: int, file_refs, extra_fields):
+        """Run blocking generate() in a thread while writing SSE keepalive comments."""
+        result_box = {"text": None, "error": None}
+        done_event = threading.Event()
+
+        def _worker():
+            try:
+                result_box["text"] = generate(prompt, model_id, think_mode, file_refs, extra_fields)
+            except Exception as exc:
+                result_box["error"] = exc
+            finally:
+                done_event.set()
+
+        thread = threading.Thread(target=_worker, name="gemini-sse-worker", daemon=True)
+        thread.start()
+        while not done_event.wait(timeout=5.0):
+            self.wfile.write(b": keepalive\n\n")
+            self.wfile.flush()
+        if result_box["error"] is not None:
+            raise result_box["error"]
+        return result_box["text"]
+
+    def _iter_stream_with_keepalive(self, prompt: str, model_id: int, think_mode: int, file_refs, extra_fields):
+        """Yield text deltas from generate_stream while flushing SSE keepalives on idle waits."""
+        events_q = queue.Queue()
+        stop_event = threading.Event()
+
+        def _worker():
+            gen = None
+            try:
+                gen = generate_stream(prompt, model_id, think_mode, file_refs, extra_fields)
+                for delta in gen:
+                    if stop_event.is_set():
+                        break
+                    events_q.put(("delta", delta))
+                if not stop_event.is_set():
+                    events_q.put(("done", None))
+            except Exception as exc:
+                if not stop_event.is_set():
+                    events_q.put(("error", exc))
+            finally:
+                if hasattr(gen, "close"):
+                    try:
+                        gen.close()
+                    except Exception:
+                        pass
+
+        thread = threading.Thread(target=_worker, name="gemini-stream-worker", daemon=True)
+        thread.start()
+        try:
+            while True:
+                try:
+                    kind, payload = events_q.get(timeout=5.0)
+                except queue.Empty:
+                    self.wfile.write(b": keepalive\n\n")
+                    self.wfile.flush()
+                    continue
+                if kind == "delta":
+                    yield payload
+                elif kind == "error":
+                    raise payload
+                else:
+                    return
+        finally:
+            stop_event.set()
 
     # ─── /v1/chat/completions ─────────────────────────────────────────────────
 
@@ -186,80 +415,206 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
+        has_tools = bool(tools and tool_choice != "none")
+        allowed_tool_names = _extract_allowed_tool_names(tools) if has_tools else set()
         prompt, images = messages_to_prompt(req.get("messages", []), tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty prompt"}}, 400)
             return
 
-        stream = req.get("stream", False)
+        stream = bool(req.get("stream", False))
+        include_usage = _wants_stream_usage(req)
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
-        try:
-            file_refs = _upload_images(images)
-        except RuntimeError as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
+        req_token = begin_request("/v1/chat/completions", model_name, stream=stream, has_tools=has_tools)
+        req_settled = False
 
-        if stream and (not tools or tool_choice == "none"):
+        def _settle(status=200, ok=True, tool_calls_count=0, response_chars=0, error=None):
+            nonlocal req_settled
+            if not req_settled:
+                req_settled = True
+                finish_request(
+                    req_token,
+                    status=status,
+                    ok=ok,
+                    tool_calls_count=tool_calls_count,
+                    prompt_chars=len(prompt),
+                    response_chars=response_chars,
+                    error=error,
+                )
+
+        try:
             try:
-                self._start_sse()
-                first_chunk = {
-                    "id": cid,
-                    "object": "chat.completion.chunk",
-                    "created": int(time.time()),
-                    "model": model_name,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"role": "assistant"},
-                        "finish_reason": None,
-                    }],
-                }
-                self.wfile.write(f"data: {json.dumps(first_chunk)}\n\n".encode())
-                self.wfile.flush()
-                for delta in generate_stream(prompt, model_id, think_mode, file_refs, extra_fields):
-                    chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                             "model": model_name, "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}]}
-                    self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
+                file_refs = _upload_images(images)
+            except RuntimeError as e:
+                _settle(status=502, ok=False, error=str(e))
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
+
+            if stream and not has_tools:
+                full_text = []
+                try:
+                    self._start_sse()
+                    self._write_sse_json({
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    })
+                    for delta in self._iter_stream_with_keepalive(
+                        prompt, model_id, think_mode, file_refs, extra_fields
+                    ):
+                        full_text.append(delta)
+                        self._write_sse_json({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": None}],
+                        })
+                    self._write_sse_json({
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                    })
+                    combined = "".join(full_text)
+                    if include_usage:
+                        self._write_sse_json({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [],
+                            "usage": _usage(prompt, combined),
+                        })
+                    self.wfile.write(b"data: [DONE]\n\n")
                     self.wfile.flush()
-                end = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                       "model": model_name, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                self.wfile.write(f"data: {json.dumps(end)}\n\n".encode())
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                    _settle(status=200, ok=True, response_chars=len(combined))
+                except CLIENT_DISCONNECT_ERRORS:
+                    _settle(status=499, ok=False, error="client disconnected")
+                except Exception as e:
+                    log(f"Stream error: {e}")
+                    _settle(status=502, ok=False, error=str(e))
+                    try:
+                        self._write_sse_json({"error": {"message": f"upstream error: {e}"}})
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                return
+
+            if stream and has_tools:
+                try:
+                    self._start_sse()
+                    self._write_sse_json({
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+                    })
+                    raw_text = self._run_generate_with_sse_keepalive(
+                        prompt, model_id, think_mode, file_refs, extra_fields
+                    )
+                except CLIENT_DISCONNECT_ERRORS:
+                    _settle(status=499, ok=False, error="client disconnected")
+                    return
+                except Exception as e:
+                    log(f"Tool stream error: {e}")
+                    _settle(status=502, ok=False, error=str(e))
+                    try:
+                        self._write_sse_json({"error": {"message": f"upstream error: {e}"}})
+                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.wfile.flush()
+                    except Exception:
+                        pass
+                    return
+
+                text = raw_text or ""
+                tool_calls = None
+                if text:
+                    text, tool_calls = parse_tool_calls(text, allowed_names=allowed_tool_names)
+                finish = "tool_calls" if tool_calls else "stop"
+                try:
+                    if text:
+                        self._write_sse_json({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"content": text}, "finish_reason": None}],
+                        })
+                    if tool_calls:
+                        indexed_calls = [{"index": idx, **tc} for idx, tc in enumerate(tool_calls)]
+                        self._write_sse_json({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [{"index": 0, "delta": {"tool_calls": indexed_calls}, "finish_reason": None}],
+                        })
+                    self._write_sse_json({
+                        "id": cid,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model_name,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    })
+                    if include_usage:
+                        self._write_sse_json({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model_name,
+                            "choices": [],
+                            "usage": _usage(prompt, raw_text or text),
+                        })
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                    _settle(
+                        status=200,
+                        ok=True,
+                        tool_calls_count=len(tool_calls or []),
+                        response_chars=len(raw_text or ""),
+                    )
+                except CLIENT_DISCONNECT_ERRORS:
+                    _settle(status=499, ok=False, error="client disconnected")
+                return
+
+            try:
+                text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
             except Exception as e:
-                log(f"Stream error: {e}")
-            return
+                _settle(status=502, ok=False, error=str(e))
+                self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
+                return
 
-        try:
-            text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
-        except Exception as e:
-            self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
-            return
-
-        tool_calls = None
-        if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
-        msg = {"role": "assistant", "content": text or None}
-        if tool_calls:
-            msg["tool_calls"] = tool_calls
-        finish = "tool_calls" if tool_calls else "stop"
-
-        if stream:
-            self._start_sse()
-            chunk = {"id": cid, "object": "chat.completion.chunk", "created": int(time.time()),
-                     "model": model_name, "choices": [{"index": 0, "delta": msg, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n".encode())
-            self.wfile.write(b"data: [DONE]\n\n")
-            self.wfile.flush()
-        else:
+            raw_len = len(text or "")
+            tool_calls = None
+            if has_tools and text:
+                text, tool_calls = parse_tool_calls(text, allowed_names=allowed_tool_names)
+            msg = {"role": "assistant", "content": text or None}
+            if tool_calls:
+                msg["tool_calls"] = tool_calls
+            finish = "tool_calls" if tool_calls else "stop"
+            _settle(
+                status=200,
+                ok=True,
+                tool_calls_count=len(tool_calls or []),
+                response_chars=raw_len,
+            )
             self.send_json({
-                "id": cid, "object": "chat.completion", "created": int(time.time()),
+                "id": cid,
+                "object": "chat.completion",
+                "created": int(time.time()),
                 "model": model_name,
                 "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
-                "usage": {"prompt_tokens": len(prompt)//4, "completion_tokens": len(text or "")//4,
-                          "total_tokens": (len(prompt)+len(text or ""))//4},
+                "usage": _usage(prompt, text),
             })
+        finally:
+            if not req_settled:
+                _settle(status=500, ok=False, error="handler exited unexpectedly")
 
     # ─── /v1/responses (Codex CLI) ───────────────────────────────────────────
 
@@ -318,21 +673,34 @@ class GeminiHandler(BaseHTTPRequestHandler):
                      if t.get("type") == "function" and "function" not in t else t for t in tools]
 
         tool_choice = req.get("tool_choice", "auto")
+        has_tools = bool(tools and tool_choice != "none")
+        allowed_tool_names = _extract_allowed_tool_names(tools) if has_tools else set()
         prompt, images = messages_to_prompt(messages, tools, tool_choice)
         if not prompt.strip():
             self.send_json({"error": {"message": "empty input"}}, 400)
             return
 
+        req_token = begin_request("/v1/responses", model_name, stream=bool(req.get("stream")), has_tools=has_tools)
         try:
             file_refs = _upload_images(images)
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
+            finish_request(req_token, status=502, ok=False, prompt_chars=len(prompt), error=str(e))
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
+        raw_len = len(text or "")
         tool_calls = None
-        if tools and text and tool_choice != "none":
-            text, tool_calls = parse_tool_calls(text)
+        if has_tools and text:
+            text, tool_calls = parse_tool_calls(text, allowed_names=allowed_tool_names)
+        finish_request(
+            req_token,
+            status=200,
+            ok=True,
+            tool_calls_count=len(tool_calls or []),
+            prompt_chars=len(prompt),
+            response_chars=raw_len,
+        )
 
         rid = f"resp_{uuid.uuid4().hex[:16]}"
         mid = f"msg_{uuid.uuid4().hex[:12]}"
@@ -507,9 +875,11 @@ class GeminiHandler(BaseHTTPRequestHandler):
             self.send_json({"error": {"message": "empty content"}}, 400)
             return
 
+        req_token = begin_request("/v1beta/models", model_name, stream=stream, has_tools=has_tools)
         try:
             file_refs = _upload_images(images)
         except RuntimeError as e:
+            finish_request(req_token, status=502, ok=False, prompt_chars=len(prompt), error=str(e))
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
         log(f"Google API: model={model_name} stream={stream} tools={has_tools} prompt_len={len(prompt)}")
@@ -539,15 +909,18 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 }
                 self.wfile.write(f"data: {json.dumps(final_chunk, ensure_ascii=False)}\n\n".encode())
                 self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+                finish_request(req_token, status=200, ok=True, prompt_chars=len(prompt), response_chars=len(full_text))
+            except CLIENT_DISCONNECT_ERRORS:
+                finish_request(req_token, status=499, ok=False, prompt_chars=len(prompt), error="client disconnected")
             except Exception as e:
                 log(f"Google stream error: {e}")
+                finish_request(req_token, status=502, ok=False, prompt_chars=len(prompt), error=str(e))
             return
 
         try:
             text = generate(prompt, model_id, think_mode, file_refs, extra_fields)
         except Exception as e:
+            finish_request(req_token, status=502, ok=False, prompt_chars=len(prompt), error=str(e))
             self.send_json({"error": {"message": f"upstream error: {e}"}}, 502)
             return
 
@@ -555,6 +928,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             log("Warning: empty response from Gemini")
 
         response_parts = []
+        function_calls = []
         if has_tools and text:
             clean_text, function_calls = parse_google_function_calls(text)
             if function_calls:
@@ -566,6 +940,14 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 response_parts.append({"text": text})
         else:
             response_parts.append({"text": text or "I apologize, but I was unable to generate a response. Please try again."})
+        finish_request(
+            req_token,
+            status=200,
+            ok=True,
+            tool_calls_count=len(function_calls),
+            prompt_chars=len(prompt),
+            response_chars=len(text or ""),
+        )
 
         candidate = {
             "content": {"parts": response_parts, "role": "model"},
